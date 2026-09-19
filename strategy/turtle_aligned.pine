@@ -1,0 +1,89 @@
+//@version=6
+// ============================================================================
+//  海龟交易系统 -- 与本地 backtrader 版本严格对齐
+//  对齐目标: strategy/turtule_trade.py + strategy/turtle_size.py
+//
+//  为了和 backtrader 一致, 故意不采用 TradingView 社区常见写法:
+//    1. 只做多, 不做空
+//    2. 没有趋势过滤均线, 去掉了 200MA
+//    3. 允许加仓, 最多 4 个单位, 每上涨 0.5N 加一次
+//    4. 仓位 = 权益 x 1% / ATR, 不是除以 ATRx2
+//       注意: 止损在 2N, 所以实际最大亏损是权益的 2%
+//    5. 止损 = 收盘判断 + 次日开盘市价平仓, 不是盘中止损单
+//    6. 手续费 0.1%, 原版写 0.001 其实是 0.001%, 差 100 倍
+//
+//  本文件刻意不使用跨行续写, 所有语句都在单行内写完。
+//  Pine 的续行规则对前导空格极其敏感, 复制粘贴时丢空格就会报
+//  Missing closing parenthesis, 单行写法从根上避免这个问题。
+//
+//  使用前: 时间框架设为 1D, Strategy Tester 日期范围设为
+//          2019-01-01 ~ 2026-09-01, 与 datas/BTCUSDT_1d.csv 一致
+// ============================================================================
+strategy(title = "Turtle aligned backtrader", overlay = true, initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 4, commission_type = strategy.commission.percent, commission_value = 0.1, slippage = 0, process_orders_on_close = false)
+
+// ==================== 参数: 与 backtrader 的 params 一一对应 ====================
+entryLen = input.int(20, "entry_window 入场通道周期", minval = 1, group = "通道")
+exitLen = input.int(10, "exit_window 出场通道周期", minval = 1, group = "通道")
+atrLen = input.int(20, "atr_window ATR周期", minval = 1, group = "风险")
+riskPct = input.float(1.0, "risk_per_trade 单笔风险 百分比", minval = 0.01, step = 0.1, group = "风险")
+cashBuf = input.float(0.1, "cash_buffer 现金缓冲 百分比", minval = 0, step = 0.01, group = "风险")
+maxUnits = input.int(4, "最多加仓单位数", minval = 1, group = "风险")
+addStep = input.float(0.5, "加仓间隔 单位ATR", minval = 0.1, step = 0.1, group = "风险")
+stopMult = input.float(2.0, "止损倍数 单位ATR", minval = 0.1, step = 0.1, group = "风险")
+
+// ==================== 指标 ====================
+// 通道都不含当前 bar, [1] 等价于 backtrader 的 get(size=N, ago=-1), 无未来函数
+entryUp = ta.highest(high, entryLen)[1]
+exitDown = ta.lowest(low, exitLen)[1]
+atr = ta.atr(atrLen)
+
+// ==================== 状态: 对应 backtrader 的 unit_count / last_entry_price ====================
+var int entryCount = 0
+var float lastEntryPrice = na
+
+// 本 bar 持仓增加, 说明上一根 bar 提交的买单在本 bar 开盘成交了
+newFill = strategy.position_size > nz(strategy.position_size[1])
+if newFill
+    entryCount := entryCount + 1
+    lastEntryPrice := open
+
+// 空仓时清账, 对应 backtrader 平仓后 unit_count = 0 且 last_entry_price = None
+if strategy.position_size == 0
+    entryCount := 0
+    lastEntryPrice := na
+
+// ==================== 仓位计算: 对应 turtle_size.py 的 _getsizing ====================
+// 1 风险仓位: size = 总权益 x risk_per_trade / atr
+riskSize = strategy.equity * riskPct / 100.0 / atr
+// 2 现金兜底: unit = 建仓本金 + 手续费, 对应 comminfo 的 getoperationcost + getcommission
+unitCost = close * 1.001
+maxByCash = strategy.cash * (1.0 - cashBuf / 100.0) / unitCost
+qty = math.min(riskSize, maxByCash)
+// backtrader 的 sizer 在 atr <= 0 或现金不够时返回 0, buy() 就直接不下单
+validQty = not na(qty) and qty > 0
+
+// ==================== 交易逻辑: 严格照抄 next() 的分支结构 ====================
+// 预热: backtrader 是 len(self.data) < max(entry_window, atr_window) + 1 就 return
+warmup = bar_index < math.max(entryLen, atrLen)
+
+// 注: backtrader 里有个 self.pending 挂单守卫, 但市价单次根就了结,
+//     那个守卫实际上是空转的, 所以这里不需要等价物
+if not warmup and validQty
+    if strategy.position_size == 0
+        if close > entryUp
+            strategy.entry("L", strategy.long, qty = qty)
+    else
+        addOn = not na(lastEntryPrice) and close >= lastEntryPrice + addStep * atr and entryCount < maxUnits
+        if addOn
+            strategy.entry("L", strategy.long, qty = qty)
+        else
+            stopLoss = not na(lastEntryPrice) and close < lastEntryPrice - stopMult * atr
+            if stopLoss or close < exitDown
+                strategy.close("L")
+
+// ==================== 可视化 ====================
+plot(entryUp, title = "入场上轨", color = color.new(color.green, 0), linewidth = 1)
+plot(exitDown, title = "出场下轨", color = color.new(color.red, 0), linewidth = 1)
+plot(lastEntryPrice - stopMult * atr, title = "止损价", color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? strategy.position_avg_price : na, title = "持仓均价", color = color.new(color.blue, 0), linewidth = 2, style = plot.style_linebr)
+bgcolor(strategy.position_size > 0 ? color.new(color.green, 92) : na)
