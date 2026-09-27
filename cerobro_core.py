@@ -10,7 +10,7 @@ data = bt.feeds.PandasData(
 )
 cerebro = bt.Cerebro()
 cerebro.adddata(data)
-cerebro.addstrategy(TurtleStrategy)
+cerebro.addstrategy(TurtleStrategy, verbose=True)
 # 仓位管理器必须注册到 cerebro，sizer 才会拿到 strategy / broker 引用
 cerebro.addsizer(TurtleSize)
 

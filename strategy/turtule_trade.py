@@ -22,6 +22,12 @@ class TurtleStrategy(bt.Strategy):
         self.pending = None
         # 订单统计
         self.stat_filled = 0
+        # 上一笔订单成交使用的atr
+        self.last_entry_n = None
+        # 下一加仓触发价格
+        self.next_add_price = None
+        # 全仓止损价
+        self.stop_price = None
         self.stat_margin = 0
         self.stat_dead = 0
         self.stat_comm = 0.0
@@ -43,26 +49,58 @@ class TurtleStrategy(bt.Strategy):
         entry_up = max(self.data.high.get(size=self.params.entry_window, ago=-1))
         exit_down = min(self.data.low.get(size=self.params.exit_window, ago=-1))
         current_price = self.data.close[0]
-        atr = self.atr[0]
 
         # 没有仓位：突破 20 日高点开仓（size 由 TurtleSize 决定）
         if not self.position:
             if current_price > entry_up:
-                self.pending = self.buy()
+                order = self.buy()
+                order.entry_n = float(self.atr[0])
+                order.order_role = 'initial_entry'
+                self.pending = order
         # 有仓位
         else:
-            # 加仓：每上涨 0.5N 加一个单位
-            if (self.last_entry_price is not None
-                    and current_price >= self.last_entry_price + 0.5 * atr
-                    and self.unit_count < 4):
-                self.pending = self.buy()
-            else:
-                # 出场：反向 2 个 ATR 止损，或跌破 10 日最低。
-                # 必须合成一个平仓分支，否则同一根 K 线出两次 close() 会把仓位打成反向
-                stop_loss = (self.last_entry_price is not None
-                             and current_price < self.last_entry_price - 2 * atr)
-                if stop_loss or current_price < exit_down:
-                    self.pending = self.close()
+            # 加仓
+            add_signal = (self.unit_count < 4 and
+                          self.next_add_price is not None and
+                          current_price >= self.next_add_price)
+
+            stop_signal = (
+                    self.stop_price is not None and
+                    current_price <= self.stop_price
+            )
+
+            channel_exit = current_price <= exit_down
+
+            if stop_signal or channel_exit:
+                if self.p.verbose:
+                    if stop_signal and channel_exit:
+                        reason = "STOP_AND_CHANNEL"
+                    elif stop_signal:
+                        reason = "STOP"
+                    else:
+                        reason = "CHANNEL"
+                    self.log(
+                        f"退出信号 reason={reason} "
+                        f"close={current_price:.2f} "
+                        f"stop={self.stop_price:.2f} "
+                        f"exit_down={exit_down:.2f} "
+                        f"units={self.unit_count}"
+                    )
+
+                self.pending = self.close()
+
+            elif add_signal:
+                if self.p.verbose:
+                    self.log(
+                        f"加仓信号 close={current_price:.2f} "
+                        f"trigger={self.next_add_price:.2f} "
+                        f"current_N={float(self.atr[0]):.2f} "
+                        f"units={self.unit_count}"
+                    )
+                order = self.buy()
+                order.entry_n = float(self.atr[0])
+                order.order_role = 'add_entry'
+                self.pending = order
 
     def notify_order(self, order):
         # 中间态：订单已提交/已被接受，还没有结果，直接忽略。
@@ -80,18 +118,47 @@ class TurtleStrategy(bt.Strategy):
             self.stat_comm += ex.comm
 
             if order.isbuy():
-                # 用真实成交价记账：成交发生在"下一根 bar 的开盘"，
-                # 而不是发出信号那根 bar 的收盘价，跳空时两者差别很大
+                fill_price = float(ex.price)
+                # 第一次买入的atr
+                fill_n = float(order.entry_n)
                 self.unit_count += 1
-                self.last_entry_price = ex.price
+                self.last_entry_price = fill_price
+                self.last_entry_n = fill_n
+                # 上升0.5N加仓一次
+                self.next_add_price = fill_price + 0.5 * fill_n
+                # 本次成交对应的候选止损
+                candidate_stop = fill_price - 2.0 * fill_n
+                if self.stop_price is None:
+                    self.stop_price = candidate_stop
+                else:
+                    # 加仓后的止损向上移动
+                    self.stop_price = max(candidate_stop, self.stop_price)
+
+
+                if self.p.verbose:
+                    self.log(
+                        f"买入成交 role={getattr(order, 'order_role', 'unknown')} "
+                        f"size={ex.size:+.8g} "
+                        f"price={fill_price:.2f} "
+                        f"N={fill_n:.2f} "
+                        f"units={self.unit_count} "
+                        f"next_add={self.next_add_price:.2f} "
+                        f"stop={self.stop_price:.2f}"
+                    )
             else:
+                if self.p.verbose:
+                    self.log(
+                        f"卖出成交 size={ex.size:+.8g} "
+                        f"price={ex.price:.2f} "
+                        f"commission={ex.comm:.2f} "
+                        f"position={self.position.size:+.8g}"
+                    )
+
                 self.unit_count = 0
                 self.last_entry_price = None
-
-            if self.p.verbose:
-                self.log(f"成交 {'买入' if order.isbuy() else '卖出'} "
-                         f"{ex.size:+.8g}@{ex.price:.2f} "
-                         f"手续费={ex.comm:.2f} 持仓={self.position.size:+.8g}")
+                self.last_entry_n = None
+                self.next_add_price = None
+                self.stop_price = None
             return
 
         # 以下都是“没能成交”，必须处理，否则就是静默丢单
