@@ -18,5 +18,13 @@ wheels/
 Thumbs.db
 
 # 临时/调试脚本
+# 注意：_*.py 也会匹配到 __init__.py，必须显式排除掉，否则包建不起来
 _*.py
+!__init__.py
 _*.txt
+
+# 回测产出（跑 export_events.py / report_stats.py / compare_pine_logs.py 重新生成）
+# 注意：datas/logs/pine-logs-*.csv 是 TradingView 手工导出的输入，不在此列，要提交
+datas/logs/*.xlsx
+datas/logs/*.png
+datas/logs/*_events.csv
