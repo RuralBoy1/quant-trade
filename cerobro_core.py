@@ -1,5 +1,5 @@
-from strategy.turtule_trade import TurtleStrategy
-from strategy.turtle_size import TurtleSize
+from strategies.turtle import TurtleStrategy
+from strategies.turtle import TurtleSize
 import pandas as pd
 
 import backtrader as bt
@@ -17,6 +17,11 @@ cerebro.addsizer(TurtleSize)
 # 设置初始资金、手续费
 cerebro.broker.setcash(100000)
 cerebro.broker.setcommission(0.001)
+#设置滑点
+cerebro.broker.set_slippage_perc(
+    perc=0.001
+
+)
 
 print(f'Starting Value: {cerebro.broker.getvalue():.2f}')
 cerebro.run()

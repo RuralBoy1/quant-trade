@@ -1,0 +1,880 @@
+//@version=6
+strategy(
+     title = "Turtle aligned with Backtrader - BTCUSDT Debug",
+     overlay = true,
+     initial_capital = 100000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     pyramiding = 4,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.1,
+     slippage = 0,
+     process_orders_on_close = false,
+     calc_on_order_fills = false,
+     calc_on_every_tick = false,
+     margin_long = 100,
+     max_labels_count = 500
+)
+
+// ============================================================
+// 本地 CSV 的固定时间范围
+// 1546300800000 = 2019-01-01 00:00:00 UTC
+// 1788220800000 = 2026-09-01 00:00:00 UTC
+//
+// 使用 const int，避免 input.time 的 CE10123 类型错误。
+// ============================================================
+
+const int DATA_START_TIME = 1546300800000
+const int DATA_END_TIME   = 1788220800000
+
+inDataRange =
+     time >= DATA_START_TIME and
+     time <= DATA_END_TIME
+
+// ============================================================
+// 策略参数
+// ============================================================
+
+entryLen = input.int(
+     20,
+     "入场通道周期",
+     minval = 1,
+     group = "通道"
+)
+
+exitLen = input.int(
+     10,
+     "退出通道周期",
+     minval = 1,
+     group = "通道"
+)
+
+atrLen = input.int(
+     20,
+     "ATR 周期",
+     minval = 1,
+     group = "风险"
+)
+
+riskPct = input.float(
+     1.0,
+     "每单位风险（权益百分比）",
+     minval = 0.01,
+     step = 0.1,
+     group = "风险"
+)
+
+cashBufPct = input.float(
+     0.1,
+     "现金缓冲（百分比）",
+     minval = 0,
+     step = 0.01,
+     group = "风险"
+)
+
+maxUnits = input.int(
+     4,
+     "最多持仓单位",
+     minval = 1,
+     maxval = 4,
+     group = "风险"
+)
+
+addStep = input.float(
+     0.5,
+     "加仓间隔（N）",
+     minval = 0.1,
+     step = 0.1,
+     group = "风险"
+)
+
+stopMult = input.float(
+     2.0,
+     "止损距离（N）",
+     minval = 0.1,
+     step = 0.1,
+     group = "风险"
+)
+
+// 这里只用于仓位计算。
+// 必须和 strategy() 中 commission_value = 0.1 保持一致。
+commissionPct = input.float(
+     0.1,
+     "仓位计算手续费（百分比）",
+     minval = 0,
+     step = 0.01,
+     group = "成本"
+)
+
+// ============================================================
+// 调试参数
+// ============================================================
+
+debugLogs = input.bool(
+     true,
+     "启用 Pine Logs",
+     group = "调试"
+)
+
+debugLabels = input.bool(
+     true,
+     "显示实际成交标签",
+     group = "调试"
+)
+
+debugSignalLabels = input.bool(
+     false,
+     "显示信号标签",
+     group = "调试"
+)
+
+debugTable = input.bool(
+     true,
+     "显示右上角状态面板",
+     group = "调试"
+)
+
+// ============================================================
+// 只使用本地 CSV 时间范围计算指标
+// ============================================================
+
+// 日期范围外填入 na，避免 TradingView 使用 2019 年以前的数据。
+rangeHigh = inDataRange ? high : na
+rangeLow = inDataRange ? low : na
+
+// 通道不包含当前 K 线，对应 Backtrader：
+// data.high.get(size=entry_window, ago=-1)
+// data.low.get(size=exit_window, ago=-1)
+entryUp = ta.highest(rangeHigh, entryLen)[1]
+exitDown = ta.lowest(rangeLow, exitLen)[1]
+
+// 第一根范围内 K 线不能引用 2018 年的收盘价。
+previousRangeClose =
+     inDataRange and
+     not na(time[1]) and
+     time[1] >= DATA_START_TIME
+     ? close[1]
+     : na
+
+trueRangeInRange =
+     inDataRange
+     ? (
+         na(previousRangeClose)
+         ? high - low
+         : math.max(
+             high - low,
+             math.max(
+                 math.abs(high - previousRangeClose),
+                 math.abs(low - previousRangeClose)
+             )
+         )
+       )
+     : na
+
+// Wilder RMA，对应 Backtrader ATR 的平滑方式。
+nValue = ta.rma(trueRangeInRange, atrLen)
+
+// ============================================================
+// 从 2019-01-01 开始重新计算预热根数
+// ============================================================
+
+var int barsFromDataStart = 0
+
+if time < DATA_START_TIME
+    barsFromDataStart := 0
+else if inDataRange
+    barsFromDataStart += 1
+
+warmupBars = math.max(entryLen, atrLen) + 1
+
+ready =
+     inDataRange and
+     barsFromDataStart >= warmupBars and
+     not na(entryUp) and
+     not na(exitDown) and
+     not na(nValue)
+
+// ============================================================
+// 策略持久状态
+// ============================================================
+
+var int unitCount = 0
+
+var float lastEntryPrice = na
+var float pendingEntryN = na
+var float lastEntryN = na
+var float nextAddPrice = na
+var float stopPrice = na
+
+var string pendingOrderRole = ""
+var string pendingExitReason = ""
+
+var int initialSignalCount = 0
+var int addSignalCount = 0
+var int exitSignalCount = 0
+var int buyFillCount = 0
+var int sellFillCount = 0
+
+// ============================================================
+// 日期边界日志
+// ============================================================
+
+enteredDataRange =
+     inDataRange and
+     (
+         na(time[1]) or
+         time[1] < DATA_START_TIME
+     )
+
+reachedDataEnd = time == DATA_END_TIME
+
+if enteredDataRange and debugLogs
+    log.info(
+         "进入本地数据范围 | 日期={0} | open={1} | high={2} | low={3} | close={4}",
+         str.format_time(time, "yyyy-MM-dd", "UTC"),
+         open,
+         high,
+         low,
+         close
+    )
+
+readyPrevious = bar_index > 0 ? ready[1] : false
+
+if ready and not readyPrevious and debugLogs
+    log.info(
+         "指标预热完成 | 日期={0} | bars={1} | entryUp={2} | exitDown={3} | N={4}",
+         str.format_time(time, "yyyy-MM-dd", "UTC"),
+         barsFromDataStart,
+         entryUp,
+         exitDown,
+         nValue
+    )
+
+// ============================================================
+// 检测实际成交
+// ============================================================
+
+previousPositionSize = nz(strategy.position_size[1], 0.0)
+
+positionAdded =
+     strategy.position_size >
+     previousPositionSize
+
+positionClosed =
+     strategy.position_size == 0 and
+     previousPositionSize > 0
+
+// ============================================================
+// 买入实际成交
+// ============================================================
+
+if positionAdded
+    addedSize =
+         strategy.position_size -
+         previousPositionSize
+
+    previousAveragePrice =
+         nz(strategy.position_avg_price[1], 0.0)
+
+    // 根据新旧持仓数量和均价反推出本次新增仓位成交价。
+    calculatedFillPrice =
+         addedSize > 0
+         ? (
+             strategy.position_avg_price *
+             strategy.position_size -
+             previousAveragePrice *
+             previousPositionSize
+           ) / addedSize
+         : strategy.position_avg_price
+
+    lastEntryPrice := calculatedFillPrice
+    lastEntryN := pendingEntryN
+
+    unitCount += 1
+    buyFillCount += 1
+
+    if not na(lastEntryN)
+        nextAddPrice :=
+             lastEntryPrice +
+             addStep * lastEntryN
+
+        candidateStop =
+             lastEntryPrice -
+             stopMult * lastEntryN
+
+        // 加仓后止损只能向上移动，不能放宽。
+        stopPrice :=
+             na(stopPrice)
+             ? candidateStop
+             : math.max(stopPrice, candidateStop)
+
+    if debugLogs
+        log.info(
+             "买入成交 | 日期={0} | role={1} | addedSize={2} | fill={3} | N={4} | units={5} | nextAdd={6} | stop={7} | avgPrice={8} | equity={9}",
+             str.format_time(time, "yyyy-MM-dd", "UTC"),
+             pendingOrderRole,
+             addedSize,
+             lastEntryPrice,
+             lastEntryN,
+             unitCount,
+             nextAddPrice,
+             stopPrice,
+             strategy.position_avg_price,
+             strategy.equity
+        )
+
+    if debugLabels
+        label.new(
+             bar_index,
+             low,
+             "BUY\n" +
+             "类型: " + pendingOrderRole + "\n" +
+             "数量: " + str.tostring(addedSize, "#.########") + "\n" +
+             "成交: " + str.tostring(lastEntryPrice, format.mintick) + "\n" +
+             "N: " + str.tostring(lastEntryN, format.mintick) + "\n" +
+             "单位: " + str.tostring(unitCount) + "\n" +
+             "加仓价: " + str.tostring(nextAddPrice, format.mintick) + "\n" +
+             "止损价: " + str.tostring(stopPrice, format.mintick),
+             style = label.style_label_up,
+             color = color.new(color.green, 5),
+             textcolor = color.white,
+             size = size.small
+        )
+
+    pendingOrderRole := ""
+
+// ============================================================
+// 卖出实际成交
+// ============================================================
+
+if positionClosed
+    sellFillCount += 1
+
+    if debugLogs
+        log.info(
+             "卖出成交 | 日期={0} | reason={1} | closedSize={2} | barOpen={3} | equity={4} | buyFills={5} | sellFills={6}",
+             str.format_time(time, "yyyy-MM-dd", "UTC"),
+             pendingExitReason,
+             previousPositionSize,
+             open,
+             strategy.equity,
+             buyFillCount,
+             sellFillCount
+        )
+
+    if debugLabels
+        label.new(
+             bar_index,
+             high,
+             "SELL\n" +
+             "原因: " + pendingExitReason + "\n" +
+             "数量: " + str.tostring(previousPositionSize, "#.########") + "\n" +
+             "开盘: " + str.tostring(open, format.mintick) + "\n" +
+             "权益: " + str.tostring(strategy.equity, "#.##"),
+             style = label.style_label_down,
+             color = color.new(color.red, 5),
+             textcolor = color.white,
+             size = size.small
+        )
+
+    unitCount := 0
+    lastEntryPrice := na
+    pendingEntryN := na
+    lastEntryN := na
+    nextAddPrice := na
+    stopPrice := na
+    pendingOrderRole := ""
+    pendingExitReason := ""
+
+// 空仓时清理持仓状态。
+// 不清除 pendingEntryN 和 pendingOrderRole，
+// 因为开仓订单可能正在等待下一根 K 线开盘成交。
+if strategy.position_size == 0 and previousPositionSize == 0
+    unitCount := 0
+    lastEntryPrice := na
+    lastEntryN := na
+    nextAddPrice := na
+    stopPrice := na
+
+// ============================================================
+// 仓位计算
+// ============================================================
+
+// 现货无杠杆多头。
+// 权益减去持仓市值，近似 Backtrader broker cash。
+estimatedCash = math.max(
+     strategy.equity -
+     math.max(strategy.position_size, 0.0) * close,
+     0.0
+)
+
+// 一个海龟单位：总权益的风险金额除以一个 N。
+riskSize =
+     not na(nValue) and nValue > 0
+     ? strategy.equity *
+       riskPct / 100.0 /
+       nValue
+     : 0.0
+
+commissionRate = commissionPct / 100.0
+
+// 对应 TurtleSize 中价格成本加手续费。
+// 第一轮滑点为零，不把滑点加入仓位成本。
+unitCost =
+     close *
+     (1.0 + commissionRate)
+
+maxByCash =
+     unitCost > 0
+     ? estimatedCash *
+       (1.0 - cashBufPct / 100.0) /
+       unitCost
+     : 0.0
+
+quantityRaw =
+     math.min(
+         riskSize,
+         maxByCash
+     )
+
+// 虚拟币数量保留 8 位小数。
+quantity =
+     math.round(
+         quantityRaw *
+         100000000.0
+     ) /
+     100000000.0
+
+validQuantity =
+     not na(quantity) and
+     quantity > 0 and
+     not na(nValue) and
+     nValue > 0
+
+// ============================================================
+// 下单逻辑
+// ============================================================
+
+if ready
+    if strategy.position_size == 0
+        entrySignal =
+             validQuantity and
+             close > entryUp
+
+        if entrySignal
+            initialSignalCount += 1
+
+            pendingEntryN := nValue
+            pendingOrderRole := "INITIAL"
+
+            if debugLogs
+                log.info(
+                     "开仓信号 | 日期={0} | close={1} | entryUp={2} | N={3} | qty={4} | estimatedCash={5} | equity={6}",
+                     str.format_time(time, "yyyy-MM-dd", "UTC"),
+                     close,
+                     entryUp,
+                     nValue,
+                     quantity,
+                     estimatedCash,
+                     strategy.equity
+                )
+
+            if debugSignalLabels
+                label.new(
+                     bar_index,
+                     low,
+                     "开仓信号\n" +
+                     "收盘: " + str.tostring(close, format.mintick) + "\n" +
+                     "上轨: " + str.tostring(entryUp, format.mintick) + "\n" +
+                     "N: " + str.tostring(nValue, format.mintick) + "\n" +
+                     "数量: " + str.tostring(quantity, "#.########"),
+                     style = label.style_label_up,
+                     color = color.new(color.blue, 10),
+                     textcolor = color.white,
+                     size = size.tiny
+                )
+
+            // process_orders_on_close=false：
+            // 市价单在下一根 K 线开盘成交。
+            strategy.entry(
+                 id = "L",
+                 direction = strategy.long,
+                 qty = quantity,
+                 comment = "Initial entry"
+            )
+
+    else
+        stopSignal =
+             not na(stopPrice) and
+             close <= stopPrice
+
+        channelExitSignal =
+             not na(exitDown) and
+             close <= exitDown
+
+        addSignal =
+             unitCount < maxUnits and
+             not na(nextAddPrice) and
+             close >= nextAddPrice
+
+        // 退出优先级高于加仓，与 Python 保持一致。
+        if stopSignal or channelExitSignal
+            exitSignalCount += 1
+
+            exitReason =
+                 stopSignal and channelExitSignal
+                 ? "STOP_AND_CHANNEL"
+                 : stopSignal
+                   ? "STOP"
+                   : "CHANNEL"
+
+            pendingExitReason := exitReason
+
+            if debugLogs
+                log.info(
+                     "退出信号 | 日期={0} | reason={1} | close={2} | stop={3} | exitDown={4} | position={5} | units={6}",
+                     str.format_time(time, "yyyy-MM-dd", "UTC"),
+                     exitReason,
+                     close,
+                     stopPrice,
+                     exitDown,
+                     strategy.position_size,
+                     unitCount
+                )
+
+            if debugSignalLabels
+                label.new(
+                     bar_index,
+                     high,
+                     "退出信号\n" +
+                     "原因: " + exitReason + "\n" +
+                     "收盘: " + str.tostring(close, format.mintick) + "\n" +
+                     "止损: " + str.tostring(stopPrice, format.mintick) + "\n" +
+                     "下轨: " + str.tostring(exitDown, format.mintick),
+                     style = label.style_label_down,
+                     color = color.new(color.orange, 5),
+                     textcolor = color.white,
+                     size = size.tiny
+                )
+
+            strategy.close(
+                 id = "L",
+                 comment = exitReason
+            )
+
+        else if addSignal and validQuantity
+            addSignalCount += 1
+
+            pendingEntryN := nValue
+            pendingOrderRole := "ADD"
+
+            if debugLogs
+                log.info(
+                     "加仓信号 | 日期={0} | close={1} | trigger={2} | N={3} | qty={4} | units={5} | stop={6}",
+                     str.format_time(time, "yyyy-MM-dd", "UTC"),
+                     close,
+                     nextAddPrice,
+                     nValue,
+                     quantity,
+                     unitCount,
+                     stopPrice
+                )
+
+            if debugSignalLabels
+                label.new(
+                     bar_index,
+                     low,
+                     "加仓信号\n" +
+                     "收盘: " + str.tostring(close, format.mintick) + "\n" +
+                     "触发: " + str.tostring(nextAddPrice, format.mintick) + "\n" +
+                     "N: " + str.tostring(nValue, format.mintick) + "\n" +
+                     "数量: " + str.tostring(quantity, "#.########"),
+                     style = label.style_label_up,
+                     color = color.new(color.purple, 10),
+                     textcolor = color.white,
+                     size = size.tiny
+                )
+
+            strategy.entry(
+                 id = "L",
+                 direction = strategy.long,
+                 qty = quantity,
+                 comment = "Add entry"
+            )
+
+// ============================================================
+// 本地数据最终日期状态
+// 不强制平仓，与 Backtrader 最后一根按市值统计一致。
+// ============================================================
+
+if reachedDataEnd and debugLogs
+    log.info(
+         "到达本地数据末尾 | 日期={0} | close={1} | position={2} | avgPrice={3} | units={4} | equity={5}",
+         str.format_time(time, "yyyy-MM-dd", "UTC"),
+         close,
+         strategy.position_size,
+         strategy.position_avg_price,
+         unitCount,
+         strategy.equity
+    )
+
+// ============================================================
+// 图表显示
+// ============================================================
+
+plot(
+     inDataRange ? entryUp : na,
+     title = "入场上轨",
+     color = color.green,
+     linewidth = 1
+)
+
+plot(
+     inDataRange ? exitDown : na,
+     title = "退出下轨",
+     color = color.red,
+     linewidth = 1
+)
+
+plot(
+     inDataRange and strategy.position_size > 0
+     ? stopPrice
+     : na,
+     title = "全仓止损价",
+     color = color.orange,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     inDataRange and strategy.position_size > 0
+     ? nextAddPrice
+     : na,
+     title = "下一加仓价",
+     color = color.purple,
+     linewidth = 1,
+     style = plot.style_linebr
+)
+
+plot(
+     inDataRange and strategy.position_size > 0
+     ? strategy.position_avg_price
+     : na,
+     title = "持仓均价",
+     color = color.blue,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+bgcolor(
+     inDataRange and strategy.position_size > 0
+     ? color.new(color.green, 92)
+     : na
+)
+
+// ============================================================
+// 数据窗口调试值
+// ============================================================
+
+plot(
+     unitCount,
+     title = "持仓单位数",
+     display = display.data_window
+)
+
+plot(
+     lastEntryPrice,
+     title = "最近买入成交价",
+     display = display.data_window
+)
+
+plot(
+     lastEntryN,
+     title = "最近成交使用的 N",
+     display = display.data_window
+)
+
+plot(
+     nextAddPrice,
+     title = "下一加仓触发价",
+     display = display.data_window
+)
+
+plot(
+     stopPrice,
+     title = "当前止损价",
+     display = display.data_window
+)
+
+plot(
+     quantity,
+     title = "下一单位数量",
+     display = display.data_window
+)
+
+plot(
+     estimatedCash,
+     title = "估算可用现金",
+     display = display.data_window
+)
+
+plot(
+     barsFromDataStart,
+     title = "数据范围内 K 线数",
+     display = display.data_window
+)
+
+// ============================================================
+// 右上角状态面板
+// ============================================================
+
+var table debugPanel = table.new(
+     position.top_right,
+     2,
+     20,
+     border_width = 1,
+     frame_color = color.gray,
+     border_color = color.new(color.gray, 50)
+)
+
+if barstate.islast
+    if debugTable
+        table.cell(
+             debugPanel, 0, 0,
+             "调试项目",
+             bgcolor = color.rgb(35, 35, 35),
+             text_color = color.white
+        )
+
+        table.cell(
+             debugPanel, 1, 0,
+             "当前值",
+             bgcolor = color.rgb(35, 35, 35),
+             text_color = color.white
+        )
+
+        table.cell(debugPanel, 0, 1, "图表品种")
+        table.cell(debugPanel, 1, 1, syminfo.tickerid)
+
+        table.cell(debugPanel, 0, 2, "当前K线日期")
+        table.cell(
+             debugPanel, 1, 2,
+             str.format_time(time, "yyyy-MM-dd", "UTC")
+        )
+
+        table.cell(debugPanel, 0, 3, "数据范围内")
+        table.cell(
+             debugPanel, 1, 3,
+             inDataRange ? "是" : "否",
+             text_color = inDataRange ? color.green : color.red
+        )
+
+        table.cell(debugPanel, 0, 4, "范围内K线数")
+        table.cell(
+             debugPanel, 1, 4,
+             str.tostring(barsFromDataStart)
+        )
+
+        table.cell(debugPanel, 0, 5, "预热完成")
+        table.cell(
+             debugPanel, 1, 5,
+             ready ? "是" : "否",
+             text_color = ready ? color.green : color.orange
+        )
+
+        table.cell(debugPanel, 0, 6, "收盘价")
+        table.cell(
+             debugPanel, 1, 6,
+             str.tostring(close, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 7, "入场上轨")
+        table.cell(
+             debugPanel, 1, 7,
+             str.tostring(entryUp, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 8, "退出下轨")
+        table.cell(
+             debugPanel, 1, 8,
+             str.tostring(exitDown, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 9, "ATR / N")
+        table.cell(
+             debugPanel, 1, 9,
+             str.tostring(nValue, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 10, "持仓数量")
+        table.cell(
+             debugPanel, 1, 10,
+             str.tostring(strategy.position_size, "#.########")
+        )
+
+        table.cell(debugPanel, 0, 11, "持仓均价")
+        table.cell(
+             debugPanel, 1, 11,
+             str.tostring(strategy.position_avg_price, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 12, "持仓单位")
+        table.cell(
+             debugPanel, 1, 12,
+             str.tostring(unitCount)
+        )
+
+        table.cell(debugPanel, 0, 13, "最近成交价")
+        table.cell(
+             debugPanel, 1, 13,
+             str.tostring(lastEntryPrice, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 14, "最近成交N")
+        table.cell(
+             debugPanel, 1, 14,
+             str.tostring(lastEntryN, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 15, "下一加仓价")
+        table.cell(
+             debugPanel, 1, 15,
+             str.tostring(nextAddPrice, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 16, "止损价")
+        table.cell(
+             debugPanel, 1, 16,
+             str.tostring(stopPrice, format.mintick)
+        )
+
+        table.cell(debugPanel, 0, 17, "下一单位数量")
+        table.cell(
+             debugPanel, 1, 17,
+             str.tostring(quantity, "#.########")
+        )
+
+        table.cell(debugPanel, 0, 18, "现金 / 权益")
+        table.cell(
+             debugPanel, 1, 18,
+             str.tostring(estimatedCash, "#.##") +
+             " / " +
+             str.tostring(strategy.equity, "#.##")
+        )
+
+        table.cell(debugPanel, 0, 19, "信号 / 买入 / 卖出")
+        table.cell(
+             debugPanel, 1, 19,
+             str.tostring(
+                 initialSignalCount +
+                 addSignalCount +
+                 exitSignalCount
+             ) +
+             " / " +
+             str.tostring(buyFillCount) +
+             " / " +
+             str.tostring(sellFillCount)
+        )
+    else
+        table.clear(debugPanel, 0, 0, 1, 19)

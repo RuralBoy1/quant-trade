@@ -7,5 +7,6 @@ requires-python = ">=3.12"
 dependencies = [
     "backtrader>=1.9.78.123",
     "matplotlib>=3.11.1",
+    "openpyxl>=3.1.5",
     "yfinance>=1.6.0",
 ]
