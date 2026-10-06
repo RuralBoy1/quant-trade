@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from strategies.meanrev import MeanRevStrategy, MeanRevSize
+from strategies.momentum import MomentTumtSize, MomentumStrategy
 from strategies.turtle import TurtleSize, TurtleStrategy
 
 
@@ -36,6 +37,13 @@ REGISTRY = {
         data="datas/BTCUSDT_1d.csv",
         pine_log=None,
     ),
+    "momentum": StrategySpec(
+        name="momentum",
+        strategy=MomentumStrategy,
+        sizer=MomentTumtSize,
+        data="datas/BTCUSDT_1d.csv",
+        pine_log=None,
+    )
 }
 
 
